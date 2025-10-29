@@ -14,182 +14,84 @@ if (!TELEGRAM_BOT_TOKEN) {
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 const connection = new Connection(SOLANA_RPC_URL, { commitment: 'confirmed' });
 
-// Common constant: USDC mint on Solana mainnet
-// (Circle's USDC mainnet mint)
+// USDC mint on Solana mainnet
 const SOL_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
-// ----- helper funcs -----
+// ---------- helper functions ----------
 function looksLikeMint(text) {
   if (!text || typeof text !== 'string') return false;
   const t = text.trim();
-  return t.length >= 32 && t.length <= 44; // base58 mint length
+  return t.length >= 32 && t.length <= 44;
 }
 
 async function getMintInfo(mint) {
   try {
     const pub = new PublicKey(mint);
     const parsed = await connection.getParsedAccountInfo(pub);
-    if (!parsed || !parsed.value) return null;
-
-    // Parsed mint account path
     const decimals = parsed?.value?.data?.parsed?.info?.decimals ?? null;
-    const supplyRaw = parsed?.value?.data?.parsed?.info?.supply ?? null; // string
-    let supply = null;
-    if (supplyRaw !== null && decimals !== null) {
-      // supply is integer string (base units). convert to human
-      const asNum = Number(supplyRaw);
-      if (!Number.isNaN(asNum)) {
-        supply = asNum / (10 ** decimals);
-      } else {
-        supply = null;
-      }
-    }
-
+    const supplyRaw = parsed?.value?.data?.parsed?.info?.supply ?? null;
+    const supply =
+      decimals !== null && supplyRaw !== null
+        ? Number(supplyRaw) / 10 ** decimals
+        : null;
     return { decimals, supply };
-  } catch (err) {
+  } catch {
     return null;
   }
 }
 
-/**
- * Get price by asking Jupiter for a quote converting 1 * token => USDC.
- * Uses Jupiter lite API quote endpoint. If no route, returns null.
- * Example doc: https://dev.jup.ag/docs/swap/get-quote
- */
 async function getPriceFromJupiter(mint, decimals) {
   try {
-    // amount = 1 token in base units
     const amount = BigInt(10) ** BigInt(decimals ?? 0);
-
-    // Jupiter lite API/quote endpoint (public)
-    const url = 'https://lite-api.jup.ag/swap/v1/quote';
     const params = {
       inputMint: mint,
       outputMint: SOL_USDC_MINT,
       amount: amount.toString(),
       slippageBps: 50,
-      restrictIntermediateTokens: true
+      restrictIntermediateTokens: true,
     };
-
-    const res = await axios.get(url, { params, timeout: 10000 });
-    const body = res.data;
-
-    // Quote format: contains outAmount / inAmount (strings) on success
-    // Example: { routes: [ { outAmount, inAmount, ... } ], ... }
-    const route = (body?.data?.routes && body.data.routes[0]) || (body?.routes && body.routes[0]) || null;
-    if (!route) {
-      // older/alternate response shape may have 'outAmount' at top level
-      const outAmount = body?.outAmount ?? body?.data?.outAmount ?? null;
-      if (!outAmount) return null;
-      // fallback: assume outAmount is USDC for amount provided
-      const out = Number(outAmount);
-      const price = out / Number(amount);
-      return price;
-    }
-
-    // outAmount is USDC in base units (usually 6 decimals)
-    const outAmountStr = route.outAmount ?? route?.outAmount;
-    if (!outAmountStr) return null;
-
-    // parse to number
-    const outAmount = Number(outAmountStr);
-    // USDC on Sol has 6 decimals (usually)
-    const usdcDecimals = 6;
-    const outHuman = outAmount / (10 ** usdcDecimals);
-
-    // price per 1 token = outHuman / 1
-    const price = outHuman;
+    const res = await axios.get('https://quote-api.jup.ag/v6/quote', {
+      params,
+      timeout: 10000,
+    });
+    const route = res.data?.routePlan?.[0];
+    const outAmount = route?.outAmount || res.data?.outAmount;
+    if (!outAmount) return null;
+    const price = Number(outAmount) / 10 ** 6; // USDC has 6 decimals
     return price;
-  } catch (err) {
-    // quiet fail - return null
+  } catch {
     return null;
   }
 }
 
-/**
- * Try to get liquidity & 24h volume from Dexscreener.
- * Attempt token-specific endpoints (best-effort).
- * Docs: https://docs.dexscreener.com/api/reference
- */
 async function getDexscreenerData(mint) {
   try {
-    // 1) token-profiles endpoint (general)
-    const tryUrls = [
-      `https://api.dexscreener.com/token-profiles/latest/v1`, // generic list (not ideal)
-      // Common per-token endpoints:
-      `https://api.dexscreener.com/latest/dex/pairs/solana/${mint}`, // pair listing
-      `https://api.dexscreener.com/latest/dex/tokens/solana/${mint}`, // token => pairs (works in many cases)
-      `https://api.dexscreener.com/token-pairs/v1/solana/${mint}` // alternative path some users show
-    ];
-
-    for (const url of tryUrls) {
-      try {
-        const res = await axios.get(url, { timeout: 8000 });
-        const body = res.data;
-        // Inspect typical fields and try to extract meaningful values.
-        // Dexscreener pair responses often include: price, liquidity, volume, priceChange
-        if (!body) continue;
-
-        // If body contains array of pairs, pick first
-        if (Array.isArray(body) && body.length > 0) {
-          const p = body[0];
-          return {
-            name: p.name ?? p.tokenName ?? null,
-            symbol: p.symbol ?? p.tokenSymbol ?? null,
-            price: p.price ? Number(String(p.price).replace(/[^0-9.\-]/g,'')) : null,
-            liquidity: p.liquidity ? Number(String(p.liquidity).replace(/[^0-9.\-]/g,'')) : null,
-            volume24h: p.volume24h ? Number(String(p.volume24h).replace(/[^0-9.\-]/g,'')) : null,
-            url: p.dexScreenerUrl ?? p.url ?? null
-          };
-        }
-
-        // If body has 'pairs' or 'pairsList'
-        const maybePairs = body?.pairs || body?.pairsList || body?.data?.pairs || body?.data;
-        if (Array.isArray(maybePairs) && maybePairs.length > 0) {
-          const p = maybePairs[0];
-          return {
-            name: p?.name ?? null,
-            symbol: p?.symbol ?? null,
-            price: p?.price ? Number(String(p.price).replace(/[^0-9.\-]/g,'')) : null,
-            liquidity: p?.liquidity ? Number(String(p.liquidity).replace(/[^0-9.\-]/g,'')) : null,
-            volume24h: p?.volume24h ? Number(String(p.volume24h).replace(/[^0-9.\-]/g,'')) : null,
-            url: p?.dexScreenerUrl ?? p?.url ?? null
-          };
-        }
-
-        // If body itself includes token info fields
-        if (body?.price || body?.liquidity || body?.volume24h) {
-          return {
-            name: body.name ?? null,
-            symbol: body.symbol ?? null,
-            price: body.price ? Number(String(body.price).replace(/[^0-9.\-]/g,'')) : null,
-            liquidity: body.liquidity ? Number(String(body.liquidity).replace(/[^0-9.\-]/g,'')) : null,
-            volume24h: body.volume24h ? Number(String(body.volume24h).replace(/[^0-9.\-]/g,'')) : null,
-            url: body.dexScreenerUrl ?? body.url ?? null
-          };
-        }
-      } catch (innerErr) {
-        // continue to next URL
-        continue;
-      }
-    }
-
-    return null;
-  } catch (err) {
+    const res = await axios.get(
+      `https://api.dexscreener.com/latest/dex/tokens/solana/${mint}`,
+      { timeout: 8000 }
+    );
+    const pair = res.data?.pairs?.[0];
+    if (!pair) return null;
+    return {
+      name: pair.baseToken.name,
+      symbol: pair.baseToken.symbol,
+      price: Number(pair.priceUsd),
+      liquidity: pair.liquidity?.usd,
+      volume24h: pair.volume?.h24,
+      url: pair.url,
+    };
+  } catch {
     return null;
   }
 }
 
 function formatNumber(n) {
   if (n === null || n === undefined) return 'N/A';
-  if (typeof n === 'number') {
-    if (Math.abs(n) >= 1) return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
-    return n.toPrecision(6);
-  }
-  return String(n);
+  if (Math.abs(n) >= 1) return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return n.toPrecision(6);
 }
 
-// ----- bot behaviour -----
+// ---------- bot logic ----------
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
@@ -197,51 +99,65 @@ bot.on('message', async (msg) => {
   if (!text) return;
 
   if (text === '/start' || text === '/help') {
-    return bot.sendMessage(chatId,
-      'Send a Solana token *mint address* and I will fetch decimals, supply (on-chain), price (via Jupiter → USDC) and liquidity/24h volume (via Dexscreener if available).',
+    return bot.sendMessage(
+      chatId,
+      '👋 Send a Solana *token mint address*, and I’ll show:\n- Price (via Jupiter)\n- Liquidity & Volume (via Dexscreener)\n- Supply & Decimals (on-chain)\n\n💡 Example:\n`So11111111111111111111111111111111111111112`',
       { parse_mode: 'Markdown' }
     );
   }
 
   if (!looksLikeMint(text)) {
-    return bot.sendMessage(chatId, 'Please send a valid-looking Solana mint address (base58).');
+    return bot.sendMessage(chatId, '⚠️ Please send a valid Solana mint address.');
   }
 
-  // Validate PublicKey
-  let mintPub;
-  try {
-    mintPub = new PublicKey(text);
-  } catch (err) {
-    return bot.sendMessage(chatId, 'Invalid Solana public key format.');
-  }
-  const mint = mintPub.toBase58();
+  const mint = text;
+  const loading = await bot.sendMessage(chatId, `🔍 Fetching token info for \`${mint}\`...`, {
+    parse_mode: 'Markdown',
+  });
 
-  const loading = await bot.sendMessage(chatId, `Fetching data for \`${mint}\` …`, { parse_mode: 'Markdown' });
-
-  // fetch on-chain mint info
   const mintInfo = await getMintInfo(mint);
   const decimals = mintInfo?.decimals ?? null;
   const supply = mintInfo?.supply ?? null;
 
-  // get price from Jupiter
-  const priceUsd = (decimals !== null) ? await getPriceFromJupiter(mint, decimals) : null;
-
-  // get dexscreener data
+  const priceUsd = decimals !== null ? await getPriceFromJupiter(mint, decimals) : null;
   const dexData = await getDexscreenerData(mint);
 
-  // Build reply
-  let reply = `💎 *Token info* \n\n`;
+  // build message
+  let reply = `💎 *Token Info*\n\n`;
   reply += `🔹 *Mint:* \`${mint}\`\n`;
-  reply += `🔢 *Decimals:* \`${decimals !== null ? decimals : 'Unknown'}\`\n`;
-  reply += `📦 *Supply:* \`${supply !== null ? formatNumber(supply) : 'Unknown'}\`\n\n`;
+  reply += `🔢 *Decimals:* \`${decimals ?? 'Unknown'}\`\n`;
+  reply += `📦 *Supply:* \`${supply ? formatNumber(supply) : 'Unknown'}\`\n\n`;
+  reply += `💰 *Price:* ${priceUsd ? `$${formatNumber(priceUsd)}` : dexData?.price ? `$${formatNumber(dexData.price)}` : 'N/A'}\n`;
+  reply += `💧 *Liquidity:* ${dexData?.liquidity ? `$${formatNumber(dexData.liquidity)}` : 'N/A'}\n`;
+  reply += `📊 *24h Volume:* ${dexData?.volume24h ? `$${formatNumber(dexData.volume24h)}` : 'N/A'}\n\n`;
 
-  reply += `💰 *Price (USD):* ${priceUsd !== null ? `$${formatNumber(priceUsd)}` : (dexData?.price ? `$${formatNumber(dexData.price)}` : 'Not available')}\n`;
-  reply += `💧 *Liquidity:* ${dexData?.liquidity ? `$${formatNumber(dexData.liquidity)}` : 'Not available'}\n`;
-  reply += `📊 *24h Volume:* ${dexData?.volume24h ? `$${formatNumber(dexData.volume24h)}` : 'Not available'}\n\n`;
+  reply += `_Sources: Solana RPC + Jupiter + Dexscreener_`;
 
-  // Dexscreener chart link (works even if not indexed)
-  reply += `🔗 *Chart:* https://dexscreener.com/solana/${mint}\n\n`;
-  reply += `_Sources: Solana RPC (mint data) + Jupiter quote API (price) + Dexscreener (liquidity/volume)._`;
+  // Inline buttons
+  const inlineKeyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '📊 View Chart', url: `https://dexscreener.com/solana/${mint}` },
+          { text: '💧 Trade on Jupiter', url: `https://jup.ag/swap/SOL-${mint}` },
+        ],
+        [{ text: '📋 Copy Contract', callback_data: `copy_${mint}` }],
+      ],
+    },
+    parse_mode: 'Markdown',
+  };
 
-  await bot.editMessageText(reply, { chat_id: chatId, message_id: loading.message_id, parse_mode: 'Markdown' });
+  await bot.editMessageText(reply, {
+    chat_id: chatId,
+    message_id: loading.message_id,
+    ...inlineKeyboard,
+  });
+});
+
+// handle "copy contract" button (optional UX)
+bot.on('callback_query', (query) => {
+  if (query.data.startsWith('copy_')) {
+    const mint = query.data.split('_')[1];
+    bot.answerCallbackQuery(query.id, { text: `Copied: ${mint}` });
+  }
 });
